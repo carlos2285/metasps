@@ -1,0 +1,4 @@
+sheet,rows,map_resultado,map_indicador,map_tendencia_esperada,map_anio,map_valor,map_anio_base_pds,map_anio_base_dato,map_anio_ultimo,map_avance,map_cambio,map_tipo_cambio,map_cumple
+Serie_completa,60,,,,,,,,,,,,
+Indicadores,440,Resultado de desarrollo,Indicador,Tendencia Esperada del indicador,Año,Valor,Año línea de base PDS 2019-2024,Línea de base (año del dato),Año último dato disponible,Avance de datos (último año disponible),Cambio,Tipo de cambio,¿Cumple tendencia esperada?
+tablas,15,,,,,,,,,,,,
