@@ -1,292 +1,338 @@
+# app.py — Dashboard de Indicadores (versión limpia y compartible)
+# ---------------------------------------------------------------
+# Características:
+# - Pestañas por "resultado"
+# - Un solo indicador a la vez (evita confusión visual)
+# - Histórico en AZUL, Proyección en ROJO punteado
+# - Slider de años controla TODO (gráfico + tabla histórico)
+# - KPIs: último valor, variación vs. año previo, y primera proyección
+# - Enlace compartible: parámetros en la URL (?res=...&ind=...&ymin=...&ymax=...)
+# - Descarga CSV de la serie (histórico + proyección)
+# - Manejo robusto de archivos (mensajes claros si falta algún CSV)
 
 import os
 import re
-from typing import List, Optional, Tuple
-
-import numpy as np
+import sys
 import pandas as pd
 import streamlit as st
-import plotly.express as px
 
+# ============ Config general ============
 st.set_page_config(
-    page_title="Dashboard de Indicadores — Serie única con proyección",
-    page_icon="📈",
+    page_title="Dashboard de Indicadores",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed"
 )
 
-# ==================== Estilos ====================
-st.markdown(
+# ============ Helpers ============
+def canon(s: str) -> str:
+    """Normaliza texto: quita dobles espacios, leading/trailing, convierte a str."""
+    s = re.sub(r"\s+", " ", str(s)).strip()
+    return s
+
+def load_csv_safe(path: str, required_cols=None) -> pd.DataFrame:
     """
-    <style>
-    :root { --radius: 14px; }
-    .block-container { padding-top: .6rem; padding-bottom: 1.2rem; }
-    .card { border-radius: var(--radius); padding: 16px; border: 1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.03); }
-    .kpi {display:flex; gap:12px; align-items:center}
-    .kpi .v {font-size: 1.35rem; font-weight:700}
-    .kpi .l {font-size:.85rem; opacity:.8}
-    .stTabs [data-baseweb="tab-list"]{ gap:.25rem; flex-wrap: wrap; }
-    .stTabs [data-baseweb="tab"]{ padding:8px 14px; border-radius: var(--radius); }
-    .dataframe tbody tr:hover { background: rgba(180,180,180,0.06) }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+    Lee CSV si existe. Si faltan columnas requeridas, devuelve df vacío con aviso.
+    """
+    if not os.path.exists(path):
+        st.warning(f"⚠️ No se encontró el archivo: `{path}`")
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        st.error(f"Error leyendo `{path}`: {e}")
+        return pd.DataFrame()
 
-# ==================== Helpers ====================
-@st.cache_data(show_spinner=False)
-def load_csv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df.columns = [re.sub(r"\s+", "_", c.strip().lower()) for c in df.columns]
-    # normalización frecuente
-    ren = {
-        "año": "anio",
-        "year": "anio",
-        "valor_n": "valor",
-        "value": "valor",
-        "nombre_indicador": "indicador",
-    }
-    for k,v in ren.items():
-        if k in df.columns and v not in df.columns:
-            df.rename(columns={k:v}, inplace=True)
+    if required_cols:
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            st.error(f"El archivo `{path}` no tiene columnas requeridas: {missing}")
+            return pd.DataFrame()
     return df
 
-def cand(df: pd.DataFrame, names: List[str]) -> Optional[str]:
-    for n in names:
-        if n in df.columns:
-            return n
-    return None
+@st.cache_data(show_spinner=False)
+def load_data(
+    hist_path="indicadores_flat.csv",
+    proy_path="proyecciones_2026_2029.csv"
+):
+    # Histórico
+    hist = load_csv_safe(hist_path)
+    if not hist.empty:
+        # columnas mínimas esperadas
+        # intentamos mapear nombres alternativos si existen
+        # (por si 'anio' llega como 'año' o 'year')
+        rename_map = {}
+        if "año" in hist.columns and "anio" not in hist.columns:
+            rename_map["año"] = "anio"
+        if "year" in hist.columns and "anio" not in hist.columns:
+            rename_map["year"] = "anio"
+        if "value" in hist.columns and "valor" not in hist.columns:
+            rename_map["value"] = "valor"
+        hist = hist.rename(columns=rename_map)
 
-def available_models():
-    opts = ["Naive (último valor)", "Media móvil (3)", "Lineal (OLS)"]
-    # Opcionales con statsmodels si disponible
-    try:
-        import statsmodels.api as sm  # noqa
-        from statsmodels.tsa.holtwinters import ExponentialSmoothing  # noqa
-        opts += ["Holt-Winters (additiva)"]
-    except Exception:
-        pass
-    return opts
+        # normalización
+        for c in ("resultado", "indicador"):
+            if c in hist.columns:
+                hist[c] = hist[c].map(canon)
 
-def fit_forecast(y: pd.Series, x: pd.Series, horizon_years: List[int], model_name: str) -> pd.Series:
-    # Asegura orden
-    order = np.argsort(x.values)
-    xv = x.values[order].astype(float)
-    yv = y.values[order].astype(float)
+        # tipos
+        if "anio" in hist.columns:
+            hist["anio"] = pd.to_numeric(hist["anio"], errors="coerce")
+        if "valor" in hist.columns:
+            hist["valor"] = pd.to_numeric(hist["valor"], errors="coerce")
 
-    if len(yv) == 0:
-        return pd.Series(dtype=float)
+        # limpieza básica
+        keep_cols = [c for c in ["resultado", "indicador", "subindicador", "anio", "valor"] if c in hist.columns]
+        hist = hist[keep_cols].dropna(subset=["resultado", "indicador", "anio"]).sort_values(["resultado","indicador","anio"])
 
-    if model_name.startswith("Naive"):
-        last = yv[-1]
-        return pd.Series([last]*len(horizon_years), index=horizon_years, dtype="float")
+    # Proyección
+    proy = load_csv_safe(proy_path)
+    if not proy.empty:
+        # normalizar posibles nombres
+        rmap = {}
+        if "anio" in proy.columns and "anio_proy" not in proy.columns:
+            rmap["anio"] = "anio_proy"
+        if "valor" in proy.columns and "valor_proy" not in proy.columns:
+            rmap["valor"] = "valor_proy"
+        proy = proy.rename(columns=rmap)
 
-    if model_name.startswith("Media móvil"):
-        if len(yv) < 3:
-            mv = np.mean(yv)
+        for c in ("resultado", "indicador"):
+            if c in proy.columns:
+                proy[c] = proy[c].map(canon)
+
+        if "anio_proy" in proy.columns:
+            proy["anio_proy"] = pd.to_numeric(proy["anio_proy"], errors="coerce")
+        if "valor_proy" in proy.columns:
+            proy["valor_proy"] = pd.to_numeric(proy["valor_proy"], errors="coerce")
+
+        # columnas útiles
+        keep_cols_p = [c for c in ["resultado","indicador","anio_proy","valor_proy"] if c in proy.columns]
+        proy = proy[keep_cols_p].dropna(subset=["anio_proy","valor_proy"]).sort_values(["anio_proy"])
+
+    return hist, proy
+
+def persist_query_params(**kwargs):
+    """
+    Guarda parámetros en la URL para compartir la vista actual.
+    Streamlit recientes: st.query_params; fallback: experimental_set_query_params.
+    """
+    qp = {}
+    for k, v in kwargs.items():
+        if v is None:
+            continue
+        if isinstance(v, (list, tuple)):
+            qp[k] = [str(x) for x in v]
         else:
-            mv = np.mean(yv[-3:])
-        return pd.Series([mv]*len(horizon_years), index=horizon_years, dtype="float")
-
-    if model_name.startswith("Lineal"):
-        # y = a + b*x (x=anio)
-        try:
-            b, a = np.polyfit(xv, yv, deg=1)
-            preds = a + b*np.array(horizon_years, dtype=float)
-            return pd.Series(preds, index=horizon_years, dtype="float")
-        except Exception:
-            return pd.Series([yv[-1]]*len(horizon_years), index=horizon_years, dtype="float")
-
-    if model_name.startswith("Holt-Winters"):
-        try:
-            from statsmodels.tsa.holtwinters import ExponentialSmoothing
-            # Índice equiespaciado por año
-            s = pd.Series(yv, index=pd.Index(xv.astype(int), name="anio")).sort_index()
-            # Sin estacionalidad (anual) — tendencia aditiva
-            model = ExponentialSmoothing(s, trend="add", seasonal=None, initialization_method="estimated")
-            fitted = model.fit()
-            # statsmodels pronostica por pasos, armamos steps como diferencia de años
-            last_year = int(s.index.max())
-            steps = [y - last_year for y in horizon_years if y > last_year]
-            fc = fitted.forecast(steps=len(steps))
-            # reindex a horizon_years (para años <= last_year, repetimos último)
-            out = []
-            for y in horizon_years:
-                if y <= last_year:
-                    out.append(float(s.loc[last_year]))
-                else:
-                    out.append(float(fc.loc[y]) if y in fc.index else float(fc.iloc[-1]))
-            return pd.Series(out, index=horizon_years, dtype="float")
-        except Exception:
-            return pd.Series([yv[-1]]*len(horizon_years), index=horizon_years, dtype="float")
-
-    # Fallback
-    return pd.Series([yv[-1]]*len(horizon_years), index=horizon_years, dtype="float")
-
-def backtest_mae(y: pd.Series, x: pd.Series, model_name: str, k:int=3) -> Optional[float]:
-    if len(y) <= k+1:
-        return None
-    train_y = y.iloc[:-k]
-    train_x = x.iloc[:-k]
-    horizon = list(x.iloc[-k:].astype(int).values)
-    preds = fit_forecast(train_y, train_x, horizon, model_name)
-    mae = np.mean(np.abs(y.iloc[-k:].values - preds.values))
-    return float(mae)
-
-def human(n):
+            qp[k] = str(v)
     try:
-        return f"{n:,.0f}".replace(",", " ")
+        st.query_params.update(qp)  # type: ignore[attr-defined]
     except Exception:
-        return str(n)
+        try:
+            st.experimental_set_query_params(**qp)
+        except Exception:
+            pass
 
-# ==================== Sidebar: archivo base ====================
-st.sidebar.title("Datos")
-base_path = st.sidebar.text_input("Ruta del CSV base (largo):", value="indicadores_flat.csv")
-uploaded = st.sidebar.file_uploader("O arrastra y suelta el CSV base", type=["csv"])
-if uploaded is not None:
-    base = pd.read_csv(uploaded)
-    tmp_name = "_uploaded_flat.csv"
-    base.to_csv(tmp_name, index=False)
-    base_path = tmp_name
+def get_query_param(name, default=None, cast=int):
+    try:
+        qp = st.query_params  # type: ignore[attr-defined]
+        val = qp.get(name, None)
+        if val is None:
+            return default
+        if isinstance(val, list):  # algunos navegadores devuelven lista
+            val = val[0] if val else None
+        if cast is None:
+            return val
+        return cast(val) if val is not None else default
+    except Exception:
+        return default
 
-with st.spinner("Cargando…"):
-    base = load_csv(base_path)
+# ============ Carga de datos ============
+HIST_PATH = os.environ.get("HIST_PATH", "indicadores_flat.csv")
+PROY_PATH = os.environ.get("PROY_PATH", "proyecciones_2026_2029.csv")
 
-# Columnas clave
-resultado_col = cand(base, ["resultado", "tipo", "bloque", "categoria", "dimension"])
-indicador_col = cand(base, ["indicador", "nombre_indicador"])
-subind_col    = cand(base, ["subindicador", "sub_indicador", "desagregacion", "categoria_detalle", "tema"])
-anio_col      = cand(base, ["anio", "año", "year"])
-valor_col     = cand(base, ["valor", "value", "y"])
+flat, proy_df = load_data(HIST_PATH, PROY_PATH)
 
-required = [resultado_col, indicador_col, anio_col, valor_col]
-if any(c is None for c in required):
-    st.error("Faltan columnas mínimas en el CSV: resultado, indicador, anio, valor. Revisa los nombres.")
+# ============ UI: Cabecera ============
+st.markdown(
+    """
+    <div style="padding:6px 0 0 0">
+      <h1 style="margin-bottom:4px;">Dashboard de Indicadores</h1>
+      <p style="color:#475569;margin-top:0">
+        Pestañas por <b>resultado</b>. Dentro de cada pestaña selecciona <b>un</b> indicador para visualizar y proyectar.
+      </p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+if flat.empty:
     st.stop()
 
-# Tipos
-base[anio_col] = pd.to_numeric(base[anio_col], errors="coerce")
-base[valor_col] = pd.to_numeric(base[valor_col], errors="coerce")
+# ============ Tabs por Resultado ============
+resultados = sorted(flat["resultado"].dropna().unique())
+tabs = st.tabs(resultados if resultados else ["(sin datos)"])
 
-min_year = int(base[anio_col].min())
-max_year = int(base[anio_col].max())
+# ============ Contenido por pestaña ============
+import plotly.express as px
 
-st.markdown("# Dashboard de Indicadores")
-st.caption("Pestañas por **resultado**. Dentro de cada pestaña selecciona **una sola serie** (indicador + subindicador opcional) para visualizar y proyectar.")
-
-# ==================== Tabs por resultado ====================
-resultados = list(pd.Series(base[resultado_col].dropna().unique()).sort_values().values)
-if not resultados:
-    st.warning("No hay resultados en la columna de agrupación.")
-    st.stop()
-
-tabs = st.tabs(resultados)
-
-for idx, res in enumerate(resultados):
-    with tabs[idx]:
-        tdf = base[base[resultado_col] == res].copy()
-        if tdf.empty:
-            st.info("Sin datos para esta categoría.")
+for i, res in enumerate(resultados):
+    with tabs[i]:
+        df_res = flat[flat["resultado"] == res].copy()
+        if df_res.empty:
+            st.info("Sin datos para este resultado.")
             continue
 
-        # Filtros específicos del resultado
-        c1, c2, c3 = st.columns([3,3,4])
+        # lista de indicadores disponibles
+        inds = sorted(df_res["indicador"].dropna().unique())
+
+        # leer de URL si viene pre-cargado
+        ind_from_url = get_query_param("ind", default=None, cast=str)
+        res_from_url = get_query_param("res", default=None, cast=str)
+        yrmin_from_url = get_query_param("ymin", default=None, cast=int)
+        yrmax_from_url = get_query_param("ymax", default=None, cast=int)
+
+        # selector de indicador (una sola serie)
+        c1, c2 = st.columns([3,2], vertical_alignment="bottom")
         with c1:
-            inds = list(pd.Series(tdf[indicador_col].dropna().unique()).sort_values().values)
-            ind_sel = st.selectbox("Indicador", options=inds, key=f"{res}-ind")
-        sdf = tdf[tdf[indicador_col] == ind_sel].copy()
-
-        with c2:
-            if subind_col and sdf[subind_col].notna().any():
-                subopts = list(pd.Series(sdf[subind_col].dropna().unique()).sort_values().values)
-                sub_sel = st.selectbox("Sub-indicador (opcional)", options=["(todos)"]+subopts, key=f"{res}-sub")
+            if ind_from_url in inds and res_from_url == res:
+                default_idx = inds.index(ind_from_url)
             else:
-                sub_sel = "(todos)"
+                default_idx = 0
+            sel_ind = st.selectbox("Indicador", inds, index=default_idx, key=f"ind_{i}")
 
-        with c3:
-            # serie 2014-2024 (histórica) + horizonte
-            vis_min = max(min_year, 2014) if max_year >= 2014 else min_year
-            vis_max = min(max_year, 2024) if max_year >= 2024 else max_year
-            rango = st.slider("Rango histórico a mostrar", min_value=min_year, max_value=max_year, value=(vis_min, vis_max), key=f"{res}-rango")
-
-        # Filtrado para la **serie única**
-        s = sdf.copy()
-        if sub_sel != "(todos)" and subind_col:
-            s = s[s[subind_col] == sub_sel]
-
-        # Asegura una sola serie (por indicador + sub)
-        s = s[[anio_col, valor_col, indicador_col] + ([subind_col] if subind_col else [])].dropna(subset=[anio_col, valor_col])
-        s = s.groupby(anio_col, as_index=False)[valor_col].mean()  # si vinieran múltiples filas por año, agregamos
-
-        s_hist = s[(s[anio_col] >= rango[0]) & (s[anio_col] <= rango[1])].sort_values(anio_col)
-
-        # KPIs
-        k1, k2, k3 = st.columns(3)
-        with k1:
-            st.markdown(f'<div class="card kpi"><div class="v">{res}</div><div class="l">resultado</div></div>', unsafe_allow_html=True)
-        with k2:
-            st.markdown(f'<div class="card kpi"><div class="v">{ind_sel}</div><div class="l">indicador</div></div>', unsafe_allow_html=True)
-        with k3:
-            last_val = s_hist[valor_col].iloc[-1] if not s_hist.empty else None
-            st.markdown(f'<div class="card kpi"><div class="v">{human(last_val) if last_val is not None else "—"}</div><div class="l">último valor</div></div>', unsafe_allow_html=True)
-
-        st.divider()
-
-        # ==================== Modelado ====================
-        m1, m2, m3 = st.columns([2,2,2])
-        with m1:
-            modelo = st.selectbox("Modelo de proyección", options=available_models(), key=f"{res}-modelo")
-        with m2:
-            h_fin = st.number_input("Año final de proyección", min_value=max(2025, rango[1]+1), max_value=2035, value=2029, step=1, key=f"{res}-h")
-        with m3:
-            back_k = st.slider("Backtest (años para MAE)", min_value=0, max_value=5, value=3, step=1, key=f"{res}-bt")
-
-        # Entrenamiento con todo el histórico (no sólo rango) hasta 2024 (si existe)
-        full_hist = s[s[anio_col] <= min(h_fin-1, max_year)].sort_values(anio_col).reset_index(drop=True)
-        if full_hist.empty:
-            st.warning("No hay datos históricos para esta serie.")
-            continue
-
-        # Backtest
-        mae_val = None
-        if back_k and len(full_hist) > back_k+1:
-            mae_val = backtest_mae(full_hist[valor_col], full_hist[anio_col], modelo, k=back_k)
-
-        # Forecast en horizonte seleccionado
-        horizon_years = list(range(int(min(max_year, 2024))+1, int(h_fin)+1))
-        fc = fit_forecast(full_hist[valor_col], full_hist[anio_col], horizon_years, modelo)
-
-        # ==================== Plot ====================
-        # Construimos df para figura (hist vs forecast). Siempre UNA serie.
-        plot_df = pd.DataFrame({
-            "anio": list(s_hist[anio_col].values) + list(fc.index.values if len(fc)>0 else []),
-            "valor": list(s_hist[valor_col].values) + list(fc.values if len(fc)>0 else []),
-            "tipo": ["Histórico"]*len(s_hist) + (["Proyección"]*len(fc) if len(fc)>0 else []),
-        })
-        plot_df = plot_df.sort_values("anio")
-
-        fig = px.line(
-            plot_df,
-            x="anio", y="valor", color="tipo",
-            markers=True,
-            title=f"{ind_sel}" + (f" — {sub_sel}" if sub_sel != '(todos)' else ""),
+        # yrs para slider
+        yr_min_real = int(df_res["anio"].min())
+        yr_max_real = int(df_res["anio"].max())
+        default_range = (
+            yrmin_from_url if (yrmin_from_url and res_from_url == res) else yr_min_real,
+            yrmax_from_url if (yrmax_from_url and res_from_url == res) else yr_max_real
         )
-        fig.update_layout(height=440, margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            ymin, ymax = st.slider(
+                "Rango histórico a mostrar",
+                min_value=yr_min_real,
+                max_value=max(yr_max_real, yr_min_real),
+                value=(int(default_range[0]), int(default_range[1])),
+                key=f"yrs_{i}"
+            )
 
-        # ==================== Tablas ====================
-        tcol1, tcol2 = st.columns([1,1])
-        with tcol1:
+        # persistimos en URL para compartir
+        persist_query_params(res=res, ind=sel_ind, ymin=ymin, ymax=ymax)
+
+        # ---------- Datos histórico (serie única) ----------
+        hist = (
+            df_res.query("indicador == @sel_ind")[["anio","valor"]]
+            .dropna()
+            .sort_values("anio")
+        )
+        hist_vis = hist.query("@ymin <= anio <= @ymax") if not hist.empty else hist.copy()
+
+        # ---------- Datos proyección ----------
+        proy = None
+        if not proy_df.empty and {"anio_proy","valor_proy"}.issubset(set(proy_df.columns)):
+            p = proy_df.copy()
+            # si proyección tiene columna indicador, filtramos por sel_ind
+            if "indicador" in p.columns:
+                p = p.query("indicador == @sel_ind")
+            # si proyección tiene columna resultado, intentamos empatar
+            if "resultado" in p.columns:
+                p = p.query("resultado == @res")
+            if not p.empty:
+                proy = p.rename(columns={"anio_proy":"anio","valor_proy":"valor"})[["anio","valor"]].dropna().sort_values("anio")
+
+        # ---------- KPIs ----------
+        k1, k2, k3 = st.columns(3)
+        if not hist.empty:
+            last_row = hist.iloc[-1]
+            prev_row = hist.iloc[-2] if len(hist) > 1 else None
+            delta = (last_row["valor"] - prev_row["valor"]) if prev_row is not None else None
+            k1.metric("Último valor (hist.)", f"{last_row['valor']:.2f}", f"{delta:+.2f}" if delta is not None else None)
+        else:
+            k1.metric("Último valor (hist.)", "–")
+
+        if proy is not None and not proy.empty:
+            k2.metric("Primera proyección", f"{proy.iloc[0]['valor']:.2f}")
+            k3.metric("Horizonte de proyección", f"{int(proy['anio'].min())}–{int(proy['anio'].max())}")
+        else:
+            k2.metric("Primera proyección", "–")
+            k3.metric("Horizonte de proyección", "–")
+
+        # ---------- Gráfico ----------
+        g_parts = []
+        if not hist.empty:
+            g_parts.append(hist.assign(tipo="Histórico"))
+        if proy is not None and not proy.empty:
+            g_parts.append(proy.assign(tipo="Proyección"))
+
+        if g_parts:
+            gg = pd.concat(g_parts, ignore_index=True).sort_values("anio")
+            fig = px.line(
+                gg, x="anio", y="valor", color="tipo",
+                markers=True,
+                color_discrete_map={"Histórico":"#2563eb","Proyección":"#dc2626"},
+                line_dash="tipo",
+            )
+            # Asegurar punteado para Proyección
+            for tr in fig.data:
+                if tr.name == "Proyección":
+                    tr.line.update(dash="dash")
+            fig.update_layout(
+                margin=dict(l=20, r=20, t=10, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                xaxis_title="año",
+                yaxis_title="valor",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No hay datos para graficar este indicador.")
+
+        # ---------- Tablas y descarga ----------
+        t1, t2 = st.columns(2)
+        with t1:
             st.markdown("**Histórico (rango visible)**")
-            st.dataframe(s_hist.rename(columns={anio_col:"anio", valor_col:"valor"}), use_container_width=True, hide_index=True)
-        with tcol2:
-            st.markdown("**Proyección**")
-            if len(fc) == 0:
-                st.info("Sin años de proyección (ajusta el año final).")
+            if not hist_vis.empty:
+                st.dataframe(
+                    hist_vis.rename(columns={"anio":"año","valor":"valor"}),
+                    use_container_width=True,
+                    hide_index=True
+                )
             else:
-                df_fc = pd.DataFrame({"anio": fc.index, "valor": fc.values})
-                st.dataframe(df_fc, use_container_width=True, hide_index=True)
+                st.caption("Sin datos históricos en el rango seleccionado.")
 
-        # Métrica de error opcional
-        if mae_val is not None:
-            st.caption(f"MAE (backtest {back_k} años): **{mae_val:,.2f}**")
+        with t2:
+            st.markdown("**Proyección**")
+            if proy is not None and not proy.empty:
+                st.dataframe(
+                    proy.rename(columns={"anio":"año","valor":"valor"}),
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.caption("Sin proyecciones disponibles para este indicador.")
+
+        # CSV combinado (hist + proy)
+        if g_parts:
+            out = pd.concat(g_parts, ignore_index=True).sort_values("anio")
+            st.download_button(
+                "⬇️ Descargar serie (CSV)",
+                data=out.to_csv(index=False).encode("utf-8"),
+                file_name=f"serie_{canon(res).replace(' ','_')}_{canon(sel_ind).replace(' ','_')}.csv",
+                mime="text/csv",
+                key=f"dl_{i}"
+            )
+
+# ============ Sección de ayuda opcional ============
+with st.expander("Ayuda y notas"):
+    st.markdown(
+        """
+        **Consejos de uso**
+        - Cada pestaña corresponde a un *resultado*.
+        - Selecciona **un** indicador por pestaña.
+        - Usa el **slider** para ajustar el rango histórico visible.
+        - El enlace de tu navegador incluye los parámetros actuales: compártelo para que otros vean **exactamente la misma vista**.
+        - El botón **Descargar serie (CSV)** exporta solo lo que necesitas (histórico + proyección de la serie seleccionada).
+
+        **Colores y estilos**
+        - **Histórico**: azul sólido  
+        - **Proyección**: rojo punteado
+        """
+    )
