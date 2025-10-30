@@ -1,189 +1,215 @@
-# app.py — Dashboard de Indicadores (Streamlit)
-# -------------------------------------------------------------
-# Requisitos: streamlit, pandas, numpy, plotly-express
-# Ejecución local:  streamlit run app.py
-# Estructura de archivos esperada (puedes cambiar rutas en la sidebar):
-#   - indicadores_flat.csv
-#   - pivot_2014_2023.csv
-#   - pivot_2014_2019.csv
-#   - pivot_2020_2024.csv
-#   - proyecciones_2026_2029.csv (opcional)
-# -------------------------------------------------------------
 
 import os
 import re
+import io
+import json
+import pathlib
+from typing import List, Optional
+
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
+import plotly.express as px
 
-st.set_page_config(page_title="Dashboard de Indicadores", layout="wide")
+st.set_page_config(
+    page_title="Dashboard de Indicadores — Tabs por tipo",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ---------- Utilidades ----------
-def clean_str(x):
-    if pd.isna(x):
-        return x
-    s = str(x).strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
+# ============ Estilos ============
+st.markdown("""
+<style>
+/* Tipografía y espaciados */
+:root { --radius: 14px; }
+.block-container { padding-top: 1rem; padding-bottom: 2rem; }
+h1, h2, h3 { letter-spacing: .2px }
+.stTabs [data-baseweb="tab-list"]{ gap:.25rem; flex-wrap: wrap; }
+.stTabs [data-baseweb="tab"]{ padding:8px 14px; border-radius: var(--radius); }
+.st-emotion-cache-13k62yr { padding-top: 0 !important } /* reduce header padding */
+
+/* Card */
+.card {
+  border-radius: var(--radius);
+  padding: 16px;
+  border: 1px solid rgba(255,255,255,.08);
+  background: rgba(255,255,255,.03);
+}
+
+/* Métricas compactas */
+.kpi {display:flex; gap:12px; align-items:center}
+.kpi .v {font-size: 1.35rem; font-weight:700}
+.kpi .l {font-size:.85rem; opacity:.8}
+
+/* Tablas */
+.dataframe tbody tr:hover { background: rgba(180,180,180,0.06) }
+</style>
+""", unsafe_allow_html=True)
+
+# ============ Helpers ============
 
 @st.cache_data(show_spinner=False)
 def load_csv(path: str) -> pd.DataFrame:
-    if not os.path.exists(path):
-        return pd.DataFrame()
     df = pd.read_csv(path)
-    # Normalización ligera
-    for c in df.select_dtypes(include=[object]).columns:
-        df[c] = df[c].map(clean_str)
+    # normalizamos nombres
+    df.columns = [re.sub(r"\s+", "_", c.strip().lower()) for c in df.columns]
     return df
 
-@st.cache_data(show_spinner=False)
-def melt_pivot(df: pd.DataFrame) -> pd.DataFrame:
-    """Convierte una pivot en formato largo (resultado, indicador, anio, valor)."""
-    if df.empty:
-        return df
-    # Detectar columnas de años
-    year_cols = [c for c in df.columns if str(c).isdigit() or (isinstance(c, (int, np.integer)))]
-    base_cols = [c for c in df.columns if c not in year_cols]
-    m = df.melt(id_vars=base_cols, value_vars=year_cols, var_name="anio", value_name="valor")
-    m["anio"] = pd.to_numeric(m["anio"], errors="coerce").astype("Int64")
-    m["valor"] = pd.to_numeric(m["valor"], errors="coerce")
-    return m.dropna(subset=["anio", "valor"]) if not m.empty else m
+def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c.lower() in df.columns:
+            return c.lower()
+    return None
 
-# ---------- Sidebar (rutas) ----------
-st.sidebar.header("Archivos")
-flat_path = st.sidebar.text_input("Ruta: indicadores_flat.csv", value="indicadores_flat.csv")
-piv_full_path = st.sidebar.text_input("Ruta: pivot_2014_2023.csv", value="pivot_2014_2023.csv")
-piv_old_path  = st.sidebar.text_input("Ruta: pivot_2014_2019.csv", value="pivot_2014_2019.csv")
-piv_new_path  = st.sidebar.text_input("Ruta: pivot_2020_2024.csv", value="pivot_2020_2024.csv")
-proj_path     = st.sidebar.text_input("Ruta (opcional): proyecciones_2026_2029.csv", value="proyecciones_2026_2029.csv")
+def humanize(n):
+    try:
+        return f"{n:,.0f}".replace(",", " ")
+    except Exception:
+        return str(n)
 
-st.sidebar.markdown("---")
-up = st.sidebar.file_uploader("O cargar indicadores_flat.csv manualmente", type=["csv"]) 
+# ============ Sidebar: Archivos ============
+st.sidebar.title("Archivos")
 
-# ---------- Carga de datos ----------
-flat = pd.read_csv(up) if up is not None else load_csv(flat_path)
-piv_full = load_csv(piv_full_path)
-piv_old  = load_csv(piv_old_path)
-piv_new  = load_csv(piv_new_path)
-proj     = load_csv(proj_path)
+default_flat = "indicadores_flat.csv"
+default_pivot_1423 = "pivot_2014_2023.csv"
+default_pivot_1419 = "pivot_2014_2019.csv"
+default_pivot_2024 = "pivot_2020_2024.csv"
+default_proj_2629 = "proyecciones_2026_2029.csv"
 
-# Asegurar columnas claves si existen
-for col in ["resultado","indicador","tendencia_esperada","anio","valor","cumple"]:
-    if col in flat.columns:
-        if col in ["anio"]:
-            flat[col] = pd.to_numeric(flat[col], errors="coerce").astype("Int64")
-        elif col in ["valor"]:
-            flat[col] = pd.to_numeric(flat[col], errors="coerce")
-        else:
-            flat[col] = flat[col].astype(str)
+flat_path = st.sidebar.text_input("Ruta: indicadores_flat.csv", value=default_flat)
+p1423_path = st.sidebar.text_input("Ruta: pivot_2014_2023.csv", value=default_pivot_1423)
+p1419_path = st.sidebar.text_input("Ruta: pivot_2014_2019.csv", value=default_pivot_1419)
+p2024_path = st.sidebar.text_input("Ruta: pivot_2020_2024.csv", value=default_pivot_2024)
+proj_path  = st.sidebar.text_input("Ruta (opcional): proyecciones_2026_2029.csv", value=default_proj_2629)
 
-# ---------- Filtros ----------
-st.title("📊 Dashboard de Indicadores")
+st.sidebar.caption("También puedes arrastrar y soltar **indicadores_flat.csv** abajo.")
+uploaded = st.sidebar.file_uploader("Cargar indicadores_flat.csv", type=["csv"])
+if uploaded is not None:
+    flat_df = pd.read_csv(uploaded)
+    flat_df.to_csv("_uploaded_flat.csv", index=False)
+    flat_path = "_uploaded_flat.csv"
 
-if flat.empty:
-    st.info("Carga 'indicadores_flat.csv' en la barra lateral o usa el cargador para continuar.")
+# ============ Carga de datos ============
+with st.spinner("Cargando datos…"):
+    base = load_csv(flat_path)
+
+anio_col = find_col(base, ["anio","año","year"])
+val_col  = find_col(base, ["valor","value","valor_n","y"])
+ind_col  = find_col(base, ["indicador","nombre_indicador","indicator"])
+tipo_col = find_col(base, ["resultado","tipo","dimension","eje","categoria"])
+ct_col   = find_col(base, ["cumple_tendencia","cumple","tendencia_ok","meets_trend"])
+
+if not anio_col or not val_col or not ind_col:
+    st.error("No se encontraron columnas mínimas requeridas: año, valor, indicador. Revisa el CSV.")
+    st.stop()
+
+# Casts seguros
+base[anio_col] = pd.to_numeric(base[anio_col], errors="coerce")
+base[val_col]  = pd.to_numeric(base[val_col], errors="coerce")
+
+# Rango de años dinámico
+min_year, max_year = int(base[anio_col].min()), int(base[anio_col].max())
+
+# ============ Encabezado ============
+st.markdown("# Dashboard de Indicadores")
+st.caption("Vista con pestañas por tipo de indicador (campo: **{}**).".format(tipo_col if tipo_col else "—"))
+
+# ============ Filtros globales ============
+c1, c2, c3, c4 = st.columns([2,2,2,4])
+with c1:
+    desarrollo = st.selectbox("Resultado de desarrollo", ["Todos"] + sorted(list(base.get(tipo_col, pd.Series(["—"])).dropna().unique()))) if tipo_col else "Todos"
+with c2:
+    ind_opt = sorted(list(base[ind_col].dropna().unique()))
+    ind_sel = st.multiselect("Indicador", options=ind_opt, default=[])
+with c3:
+    trend_opt = ["Todos"]
+    if ct_col:
+        trend_opt += sorted(list(base[ct_col].dropna().astype(str).unique()))
+    trend_sel = st.selectbox("¿Cumple tendencia?", options=trend_opt, index=0)
+with c4:
+    yr = st.slider("Rango de años", min_value=min_year, max_value=max_year, value=(min_year, max_year))
+
+# Aplica filtros globales
+df = base.copy()
+if desarrollo != "Todos" and tipo_col:
+    df = df[df[tipo_col] == desarrollo]
+if ind_sel:
+    df = df[df[ind_col].isin(ind_sel)]
+if trend_sel != "Todos" and ct_col:
+    df = df[df[ct_col].astype(str) == str(trend_sel)]
+df = df[(df[anio_col] >= yr[0]) & (df[anio_col] <= yr[1])]
+
+# ============ Pestañas por tipo (resultado) ============
+if tipo_col:
+    categorias = list(df[tipo_col].dropna().unique())
 else:
-    cols = st.columns([1,1,1,1])
-    res_opts = sorted([x for x in flat.get("resultado", pd.Series(dtype=str)).dropna().unique()])
-    ind_opts = sorted([x for x in flat.get("indicador", pd.Series(dtype=str)).dropna().unique()])
-    cum_opts = sorted([x for x in flat.get("cumple", pd.Series(dtype=str)).dropna().unique()])
+    categorias = ["Todos"]
 
-    with cols[0]:
-        sel_res = st.multiselect("Resultado de desarrollo", res_opts, default=res_opts[:5] if res_opts else [])
-    with cols[1]:
-        sel_ind = st.multiselect("Indicador", ind_opts, default=ind_opts[:10] if ind_opts else [])
-    with cols[2]:
-        sel_cum = st.multiselect("¿Cumple tendencia?", cum_opts, default=cum_opts)
-    with cols[3]:
-        year_min, year_max = int(np.nanmin(flat["anio"])) if "anio" in flat.columns and not flat["anio"].isna().all() else 2014, int(np.nanmax(flat["anio"])) if "anio" in flat.columns and not flat["anio"].isna().all() else 2024
-        sel_years = st.slider("Rango de años", min_value=min(2010, year_min), max_value=max(2029, year_max), value=(2014, year_max))
+if not categorias:
+    st.info("No hay datos para los filtros seleccionados.")
+    st.stop()
 
-    q = flat.copy()
-    if sel_res:
-        q = q[q.get("resultado").isin(sel_res)] if "resultado" in q.columns else q
-    if sel_ind:
-        q = q[q.get("indicador").isin(sel_ind)] if "indicador" in q.columns else q
-    if sel_cum:
-        q = q[q.get("cumple").isin(sel_cum)] if "cumple" in q.columns else q
-    if "anio" in q.columns:
-        q = q[(q["anio"]>=sel_years[0]) & (q["anio"]<=sel_years[1])]
+tab_objs = st.tabs([f"{str(cat)}" for cat in categorias])
 
-    # ---------- Tabs ----------
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Resumen / Serie (largo)",
-        "Serie completa 2014-2023",
-        "2014-2019 (pre-base)",
-        "2020-2024 (post-base)",
-        "Proyecciones 2026–2029"
-    ])
-
-    with tab1:
-        st.subheader("Datos en formato largo")
-        st.dataframe(q, use_container_width=True)
-        # Gráfico línea por indicador
-        if not q.empty and {"anio","valor"}.issubset(q.columns):
-            st.markdown("**Serie temporal**")
-            color_col = "indicador" if "indicador" in q.columns else None
-            fig = px.line(q.sort_values(["indicador","anio"]) if color_col else q.sort_values("anio"), 
-                          x="anio", y="valor", color=color_col, markers=True,
-                          hover_data=[c for c in ["resultado","tendencia_esperada","cumple"] if c in q.columns])
-            st.plotly_chart(fig, use_container_width=True)
-
-    with tab2:
-        st.subheader("Tabla dinámica — Serie completa 2014–2023")
-        st.dataframe(piv_full, use_container_width=True)
-        mfull = melt_pivot(piv_full)
-        if not mfull.empty:
-            fig = px.line(mfull, x="anio", y="valor", color="indicador", markers=True,
-                          hover_data=[c for c in ["resultado"] if c in mfull.columns])
-            st.plotly_chart(fig, use_container_width=True)
-
-    with tab3:
-        st.subheader("Tabla dinámica — 2014–2019 (pre-base)")
-        st.dataframe(piv_old, use_container_width=True)
-        mold = melt_pivot(piv_old)
-        if not mold.empty:
-            fig = px.line(mold, x="anio", y="valor", color="indicador", markers=True,
-                          hover_data=[c for c in ["resultado"] if c in mold.columns])
-            st.plotly_chart(fig, use_container_width=True)
-
-    with tab4:
-        st.subheader("Tabla dinámica — 2020–2024 (post-base)")
-        st.dataframe(piv_new, use_container_width=True)
-        mnew = melt_pivot(piv_new)
-        if not mnew.empty:
-            fig = px.line(mnew, x="anio", y="valor", color="indicador", markers=True,
-                          hover_data=[c for c in ["resultado"] if c in mnew.columns])
-            st.plotly_chart(fig, use_container_width=True)
-
-    with tab5:
-        st.subheader("Proyecciones 2026–2029 (tendencia lineal)")
-        if proj.empty:
-            st.info("No se encontró 'proyecciones_2026_2029.csv'. Puedes generarlo o subirlo en la barra lateral.")
+for i, cat in enumerate(categorias):
+    with tab_objs[i]:
+        if tipo_col:
+            tdf = df[df[tipo_col] == cat].copy()
         else:
-            st.dataframe(proj, use_container_width=True)
-            if not q.empty and {"anio","valor"}.issubset(q.columns):
-                # Combinar q (histórico filtrado) + proyecciones del/los indicadores visibles
-                merge_cols = ["indicador"] + (["resultado"] if "resultado" in proj.columns and "resultado" in q.columns else [])
-                psub = proj.copy()
-                if sel_ind:
-                    psub = psub[psub["indicador"].isin(sel_ind)]
-                if sel_res and "resultado" in psub.columns:
-                    psub = psub[psub["resultado"].isin(sel_res)]
-                hist = q[[c for c in q.columns if c in merge_cols + ["anio","valor"]]].copy()
-                hist = hist.rename(columns={"anio":"anio_proy","valor":"valor_hist"})
-                # Ensamble para gráfico
-                g_hist = hist.rename(columns={"anio_proy":"anio"})[[*merge_cols, "anio", "valor_hist"]]
-                g_hist = g_hist.rename(columns={"valor_hist":"valor"})
-                g_hist["tipo"] = "observado"
-                g_proj = psub.rename(columns={"valor_proy":"valor"})[[*merge_cols, "anio_proy","valor"]]
-                g_proj = g_proj.rename(columns={"anio_proy":"anio"})
-                g_proj["tipo"] = "proyectado"
-                gg = pd.concat([g_hist, g_proj], ignore_index=True)
-                fig = px.line(gg.sort_values([*merge_cols, "anio"]), x="anio", y="valor", color="indicador", line_dash="tipo",
-                              markers=True, hover_data=[c for c in ["resultado","tipo"] if c in gg.columns])
-                st.plotly_chart(fig, use_container_width=True)
+            tdf = df.copy()
 
-st.markdown("---")
-st.caption("Esta app lee archivos CSV generados del Excel fuente y permite filtros por resultado, indicador y cumplimiento de tendencia, con tablas dinámicas y proyecciones simples.")
+        # KPIs
+        k1, k2, k3 = st.columns(3)
+        n_ind = tdf[ind_col].nunique()
+        n_obs = len(tdf)
+        last_year = int(tdf[anio_col].max()) if not tdf.empty else None
+        with k1:
+            st.markdown(f'<div class="card kpi"><div class="v">{n_ind}</div><div class="l">indicadores</div></div>', unsafe_allow_html=True)
+        with k2:
+            st.markdown(f'<div class="card kpi"><div class="v">{humanize(n_obs)}</div><div class="l">observaciones</div></div>', unsafe_allow_html=True)
+        with k3:
+            st.markdown(f'<div class="card kpi"><div class="v">{last_year if last_year else "—"}</div><div class="l">último año</div></div>', unsafe_allow_html=True)
+
+        st.divider()
+
+        # Selector interno por indicador (para gráfica)
+        ind_local = sorted(list(tdf[ind_col].dropna().unique()))
+        chosen = st.multiselect("Selecciona 1–6 indicadores para graficar", ind_local, default=ind_local[:min(3, len(ind_local))], max_selections=6)
+
+        gdf = tdf[tdf[ind_col].isin(chosen)].copy()
+        if gdf.empty:
+            st.warning("Sin datos para graficar con la selección actual.")
+        else:
+            # línea temporal
+            fig = px.line(
+                gdf.sort_values([ind_col, anio_col]),
+                x=anio_col, y=val_col, color=ind_col,
+                markers=True,
+                title=f"Evolución temporal — {cat if tipo_col else 'Todos'}"
+            )
+            fig.update_layout(height=420, margin=dict(l=10,r=10,t=50,b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### Datos en formato largo")
+        st.dataframe(
+            tdf.sort_values([ind_col, anio_col]).reset_index(drop=True),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+# ============ Sección opcional: Otras tablas ============
+with st.expander("Ver tablas opcionales (pivots y proyecciones)"):
+    for label, path in [
+        ("Serie completa 2014–2023", p1423_path),
+        ("2014–2019 (pre-base)",   p1419_path),
+        ("2020–2024 (post-base)",  p2024_path),
+        ("Proyecciones 2026–2029", proj_path),
+    ]:
+        try:
+            if path and os.path.exists(path):
+                p = load_csv(path)
+                st.markdown(f"**{label}**")
+                st.dataframe(p, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"No se pudo cargar {label}: {e}")
